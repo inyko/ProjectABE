@@ -15,6 +15,8 @@ if( typeof performance === "undefined" ){
     else global.performance = { now:()=>(new Date()).getTime() };
 }
 
+let staticOp = {begin:"", end:"", srDirty:0};
+
 class Atcore {
 
     constructor( desc ){
@@ -193,33 +195,69 @@ class Atcore {
 	this.native = {};
 
         this.codec.forEach( op =>{
-            if( op.str ) parse( op );
-            op.argv = Object.assign({}, op.args) 
-            op.bytes = op.bytes || 2;
-            op.cycles = op.cycles || 1;
+            if( op.str ) this.parse( op );
         });
+
+	this.codec = this.codec.sort( (a, b)=>b.score-a.score );
+
+	self.codecs = this.codec;
+
+	let memory = this.memory;
+	let readMap = this.readMap, writeMap = this.writeMap;
+	let THIS = this;
+	
+	this.read = function( addr, pc ){
+	    
+            var value = memory[ addr ];
+
+            var periferal = readMap[ addr ];
+            if( periferal ){
+		var ret = periferal( value );
+		if( ret !== undefined ) value = ret;
+            }
+
+	    if( THIS.debuggerEnabled ){
+
+		THIS.lastReadValue = value;
+		THIS.lastReadAddr = addr;
+
+		if( THIS.readBreakpoints[addr] ){
+		    THIS.endTick = THIS.tick;
+		    THIS.breakpointHit = true;
+		}
+		
+	    }
+
+            return value;
+	    
+	};
+
+	this.write = function( addr, value ){
+
+	    var periferal = writeMap[ addr ];
+
+	    if( periferal ){
+		var ret = periferal( value, memory[ addr ] );
+		if( ret === false ) return;
+		if( ret !== undefined ) value = ret;
+	    }
+
+	    if( THIS.debuggerEnabled ){
+	    
+		THIS.lastWriteValue = value;
+		THIS.lastWriteAddr = addr;
+	    
+		if( THIS.writeBreakpoints[addr] ){
+		    THIS.endTick = THIS.tick;
+		    THIS.breakpointHit = true;
+		}
+	    }
+
+	    return memory[ addr ] = value;
+	}
+	
     }
     
-    read( addr, pc ){
-        var value = this.memory[ addr ];
-
-        var periferal = this.readMap[ addr ];
-        if( periferal ){
-            var ret = periferal( value );
-            if( ret !== undefined ) value = ret;
-        }
-
-	this.lastReadValue = value;
-	this.lastReadAddr = addr;
-
-	if( this.debuggerEnabled && this.readBreakpoints[addr] ){
-	    this.endTick = this.tick;
-	    this.breakpointHit = true;
-	}
-
-        return value;
-    }
-
     readBit( addr, bit, pc ){
 
         var value = this.memory[ addr ];
@@ -241,26 +279,6 @@ class Atcore {
         return (value >>> bit) & 1;
     }
 
-    write( addr, value ){
-
-        var periferal = this.writeMap[ addr ];
-
-        if( periferal ){
-            var ret = periferal( value, this.memory[ addr ] );
-            if( ret === false ) return;
-            if( ret !== undefined ) value = ret;
-        }
-
-	this.lastWriteValue = value;
-	this.lastWriteAddr = addr;
-	
-	if( this.debuggerEnabled && this.writeBreakpoints[addr] ){
-	    this.endTick = this.tick;
-	    this.breakpointHit = true;
-	}
-
-        return this.memory[ addr ] = value;
-    }
 
     writeBit( addr, bit, bvalue ){
 	bvalue = (!!bvalue) | 0;
@@ -330,7 +348,7 @@ class Atcore {
 		    else if( !this.getBlock() )
 			break;
 		}else{
-		    this.tick += 100;
+		    this.tick += 1000;
 		}
 
 
@@ -339,12 +357,8 @@ class Atcore {
 	}else{
 
 	    while( this.tick < this.endTick ){
-
-		while( this.history.length > 100 ) this.history.shift();
 		
 		if( !this.sleeping ){
-
-		    if( this.pc > 0xFFFF ) break;
 
 		    var func = this.native[ this.pc ];
 		    // if( !func ) 		    console.log( this.pc );
@@ -352,12 +366,13 @@ class Atcore {
 		    else if( !this.getBlock() )
 			break;
 		}else{
-		    this.tick += 100;
+		    this.tick += 1000;
 		}
 		
 		if( this.tick >= this.endTick || this.tick - lastUpdate > 1000 ){
 		    lastUpdate = this.tick;
 		    this.updatePeriferals();
+		    while( this.history.length > 100 ) this.history.shift();
 		}
 
 	    }
@@ -402,20 +417,28 @@ class Atcore {
         this.time = now;
     }
 
-    getBlock(){
+    getBlock( execute ){
+
+		if( execute == undefined )
+			execute = true;
+		
+		if( this.pc >= 0xFFFF ){
+			this.pc = 0;
+			return false;
+		}
 	
-	this.history.push( "#" + (this.pc << 1).toString(16).padStart( 4, "0" ) );
+	// this.history.push( "#" + (this.pc << 1).toString(16).padStart( 4, "0" ) );
 
         var startPC = this.pc;
 
         var skip = false, prev = false, dbg = this.debuggerEnabled;
         var cacheList = ['reg', 'wreg', 'io', 'memory', 'sram', 'flash']
-	
-	
-	if( dbg )
-	    cacheList.push("breakpoints");
+		
+		
+		if( dbg )
+			cacheList.push("breakpoints");
 	    
-        var code = '"use strict";\nvar sp=this.sp, r, t1, i8a=this.i8a, SKIP=false, ';
+        var code = '"use strict";\nvar sp=this.sp, r, t1, i8a=this.i8a, SKIP=false, read=this.read, write=this.write, ';
         code += cacheList.map(c=> `${c} = this.${c}`).join(', ');
         code += ';\n';
         code += 'var sr = memory[0x5F]';
@@ -423,44 +446,48 @@ class Atcore {
             code += `, sr${i} = (sr>>${i})&1`;
         code += ';\n';
 
-        code += 'switch( this.pc ){\n';
+		
+		code += 'switch( this.pc ){\n';
+		// code += 'while(1){\n';
 
-	let addrs = [];
-
+		let addrs = [];
+		let doTickCheck = 1;
         do{
-	    
+			
             var inst = this.identify();
             if( !inst ){
                 // inst = nop;
-		this.history.push( this.error );
-		this.pc++;
+				this.history.push( this.error );
+				this.pc++;
                 return;
             }
 
-	    addrs.push( this.pc );
-
-            code += `\ncase ${this.pc}: // #` + (this.pc<<1).toString(16) + ": " + inst.name + ' [' + inst.decbytes.toString(2).padStart(16, "0") + ']' + '\n';
+            code += `\ncase ${this.pc}:`;
 
             var chunk = `\n\tthis.pc = ${this.pc};\n`;
 	    
-	    if( dbg ){
-		chunk += '\nif( !breakpoints.disableFirst ){\n';
-		chunk += `\n\tif( breakpoints[${this.pc}] && breakpoints[${this.pc}](${this.pc},this.sp) )`;
-		chunk += '{\n\t\tthis.endTick = this.tick;\n';
-		chunk += '\t\tthis.breakpointHit = true;\n';
-		chunk += '\t\tbreak;\n\t}\n';
-	    }
-	    
-	    chunk += `\tif( (this.tick += ${inst.cycles}) >= this.endTick ) break;\n`;
+			if( dbg ){
+				chunk += '\nif( !breakpoints.disableFirst ){\n';
+				chunk += `\n\tif( breakpoints[${this.pc}] && breakpoints[${this.pc}](${this.pc},this.sp) )`;
+				chunk += '{\n\t\tthis.endTick = this.tick;\n';
+				chunk += '\t\tthis.breakpointHit = true;\n';
+				chunk += '\t\tbreak;\n\t}\n';
+			}
+			doTickCheck--;
+			if( doTickCheck <= 0 ){
+				chunk += `\tif( (this.tick += ${inst.cycles}) >= this.endTick ) break;\n`;
+				doTickCheck = 5;
+			}else chunk += `\tthis.tick += ${inst.cycles};\n`;
 
-	    if( dbg ){
-		chunk += '\n}else{\n';
-		chunk += '\tthis.tick += ' + inst.cycles + ';\n';
-		chunk += '\tbreakpoints.disableFirst = false;\n';
-		chunk += '}\n';
-	    }
-	                
+			if( dbg ){
+				chunk += '\n}else{\n';
+				chunk += '\tthis.tick += ' + inst.cycles + ';\n';
+				chunk += '\tbreakpoints.disableFirst = false;\n';
+				chunk += '}\n';
+			}
+	        
             var op = this.getOpcodeImpl( inst, inst.impl );
+			
             var srDirty = op.srDirty;
             var line = op.begin, endline = op.end;
             if( inst.flags ){
@@ -496,28 +523,32 @@ class Atcore {
         }while( this.pc < this.prog.length && (!inst.end || skip || prev) )
 
         code += `\nthis.pc = ${this.pc};\n`;
-	code += `break;\ndefault: this.tick += 2; console.warn('fell through #' + (this.pc++<<1).toString(16));\n`;
-        code += `\n\n}`;
-        // code += cacheList.map(c=>`this.${c} = ${c};`).join('\n');
-        code += 'this.sp = sp;\n';
+		code += `break;\n`;
 
-        var endPC = this.pc;
-        this.pc = startPC;
+        code += '\n\n}';
+		code += 'this.sp = sp;\n';
+
+		var endPC = this.pc;
 
         code = "return (function _" + (startPC<<1).toString(16) + "(){\n"
              + code
              + "});";
 
         try{
+
             var func = (new Function( code ))();
 
-            for( var i=0; i<addrs.length; ++i )
-                this.native[ addrs[i] ] = func;
+            for( var i=startPC; i<endPC; ++i )
+                this.native[ i ] = func;
 
-            func.call( this );
+			if( execute ){
+				this.pc = startPC;
+				func.call( this );
+			}
+
         }catch(ex){
 
-	    this.history.push( "Error on 0x" + startPC + ": " + ex.toString() );
+			this.history.push( "Error on 0x" + startPC + ": " + ex.toString() );
             
             setTimeout(()=>{
                 debugger;
@@ -527,7 +558,7 @@ class Atcore {
             throw ex;
         }
 
-        return true;
+        return endPC;
 
     }
 
@@ -546,8 +577,6 @@ class Atcore {
         bytes2 = prog[pc] >>> 0;
         bytes4 = ((bytes2 << 16) | (prog[pc+1])) >>> 0;
 
-        let verbose = 1;
-
         for( ; i<l; ++i ){
 
             var desc = codec[i];
@@ -557,18 +586,11 @@ class Atcore {
 
             if( size === 4 ){
 
-                if( verbose==2 || verbose == desc.name )
-                    console.log( desc.name + "\n" + bin(bytes4 & mask, 8*4) + "\n" + bin(opcode, 8*4) );
-
                 if( (bytes4 & mask)>>>0 !== opcode )
                     continue;
                 bytes = bytes4;
 
             }else{
-
-
-                if( verbose==2 || verbose == desc.name )
-                    console.log( desc.name + "\n" + bin(bytes2 & mask, 8*2) + "\n" + bin(opcode, 8*2) );
 
                 if( (bytes2 & mask)>>>0 !== opcode )
                     continue;
@@ -640,8 +662,122 @@ class Atcore {
 
     }
 
-    getOpcodeImpl( inst, str ){
-        var i, l, op = {begin:"", end:"", srDirty:0};
+    parse( out ){
+	var opcode = 0;
+	var mask = 0;
+	var args = {};
+	var argv = {};
+	var nargv = 0x00080000;
+	
+
+	var str = out.str, l=str.length;
+	for( var i=0; i<l; ++i ){
+            var chr = str[i];
+            var bit = (l-i-1)>>>0;
+            if( chr == '0' ){
+		mask |= 1<<bit;
+            }else if( chr == '1' ){
+		mask |= 1<<bit;
+		opcode |= 1<<bit;            
+            }else{
+		if( !(chr in args) ){
+                    args[chr] = 0;
+		    argv[chr] = nargv++;
+		}
+		args[chr] |= 1<<bit;
+            }
+	}
+
+	out.opcode = opcode;
+	out.mask = mask;
+	out.args = args;
+	out.argv = argv;
+	out.bytes = (l/8)|0;
+	out.bytes = out.bytes || 2;
+	out.cycles = out.cycles || 1;
+	out.score = out.score || 0;
+
+	var op = this.getOpcodeImpl( out, out.impl );
+
+	out.parsedBegin = getParsed( op.begin );
+	out.parsedEnd = getParsed( op.end );
+	out.parsedsrDirty = op.srDirty|0;
+
+	if( out.flags ){
+	    
+            for( var i=0, l=out.flags.length; i<l; ++i ){
+                var flagOp = this.getOpcodeImpl( out, this.flags[out.flags[i]] );
+
+		var tmp = getParsed(flagOp.begin);
+		out.parsedBegin[ out.parsedBegin.length-1 ] += tmp[0];
+		for( var j=1; j<tmp.length; ++j )
+		    out.parsedBegin.push( tmp[j] );
+
+		tmp = getParsed( flagOp.end );
+                out.parsedEnd[ out.parsedEnd.length-1 ] += tmp[0];
+		for( j=1; j<tmp.length; ++j )
+		    out.parsedEnd.push( tmp[j] );
+		
+                out.parsedsrDirty |= flagOp.srDirty;
+            }
+	    
+	    out.flags = null;
+	    
+	}
+
+	function getParsed( impl ){
+	    if( !impl ) return [""];
+	    
+	    var parsed = [impl];
+	    
+	    for( var k in args ){
+		
+		var klc = k.toLowerCase();
+		var val = argv[k];
+		
+		for( var i=parsed.length-1; i>=0; i-=2 ){
+		    var parts = parsed[i].split( val );
+		    var oparts = [i, 1];
+		    parts.forEach( p => oparts.push( p, k ) );
+		    oparts.pop();
+		    parsed.splice.apply( parsed, oparts );
+		}
+		
+	    }
+
+	    return parsed;
+	    
+	}
+
+    }
+
+    
+    getOpcodeImpl( inst, str, useParsed=true ){
+        var i, l, op = staticOp;
+
+	if( inst.parsedBegin && str === inst.impl && useParsed ){
+	    op.begin = getParsed( inst.parsedBegin );
+	    op.end   = getParsed( inst.parsedEnd );
+	    op.srDirty = inst.parsedsrDirty;
+	    
+	    function getParsed( arr ){
+		
+		var ret = "", i = 0;
+		if( arr.length > 1 )
+		    for( i; i<arr.length-1; ){
+			ret += arr[i++];
+			ret += inst.argv[arr[i++]];
+		    }
+		
+		ret += arr[i++];
+		
+		return ret;
+	    }
+	    
+	    return op;
+	}
+
+	op = {begin:"", end:"", srDirty:0};
 
         if( Array.isArray(str) ){
             for( i = 0, l=str.length; i<l; ++i ){
@@ -730,8 +866,8 @@ class Atcore {
 
         str = str.replace(/FLASH\(([XYZ])\)\s*←(.*);?$/g, (m, n, v) => 'flash[ wreg[' + (n.charCodeAt(0)-87) + '] ] = ' + v + ';');
         str = str.replace(/FLASH\(([XYZ])\)/g, (m, n) => 'flash[ wreg[' + (n.charCodeAt(0)-87) + '] ]');
-        str = str.replace(/\(([XYZ])(\+[0-9]+)?\)\s*←(.*);?$/g, (m, n, off, v) => 'this.write( wreg[' + (n.charCodeAt(0)-87) + ']' + (off||'') + ', ' + v + ');');
-        str = str.replace(/\(([XYZ])(\+[0-9]+)?\)/g, (m, n, off) => 'this.read( wreg[' + (n.charCodeAt(0)-87) + ']' + (off||'') + ', this.pc )');
+        str = str.replace(/\(([XYZ])(\+[0-9]+)?\)\s*←(.*);?$/g, (m, n, off, v) => 'write( wreg[' + (n.charCodeAt(0)-87) + ']' + (off||'') + ', ' + v + ');');
+        str = str.replace(/\(([XYZ])(\+[0-9]+)?\)/g, (m, n, off) => 'read( wreg[' + (n.charCodeAt(0)-87) + ']' + (off||'') + ', this.pc )');
 
 	if( !this.debuggerEnabled ){
             str = str.replace(/\(STACK\)\s*←/g, 'memory[sp--] =');
@@ -739,19 +875,19 @@ class Atcore {
             str = str.replace(/\(STACK2\)\s*←(.*)/g, 't1 = $1;\nmemory[sp--] = t1>>8;\nmemory[sp--] = t1;\n');
             str = str.replace(/\((STACK2)\)/g, '(memory[++sp] + (memory[++sp]<<8))');
 	}else{
-            str = str.replace(/\(STACK\)\s*←(.*)/g, 'this.write(sp--, $1)');
-            str = str.replace(/\((STACK)\)/g, 'this.read(++sp)');
-            str = str.replace(/\(STACK2\)\s*←(.*)/g, 't1 = $1;\nthis.write(sp--, t1>>8);\nthis.write(sp--, t1);\n');
-            str = str.replace(/\((STACK2)\)/g, '(this.read(++sp) + (this.read(++sp)<<8))');
+            str = str.replace(/\(STACK\)\s*←(.*)/g, 'write(sp--, $1)');
+            str = str.replace(/\((STACK)\)/g, 'read(++sp)');
+            str = str.replace(/\(STACK2\)\s*←(.*)/g, 't1 = $1;\nwrite(sp--, t1>>8);\nwrite(sp--, t1);\n');
+            str = str.replace(/\((STACK2)\)/g, '(read(++sp) + (read(++sp)<<8))');
 	}
 
         str = str.replace(/⊕/g, '^');
         str = str.replace(/•/g, '&');
 
-        str = str.replace(/io\[([0-9]+)\]\s*←(.*?);?$/g, 'this.write( 32+$1, $2 )');
+        str = str.replace(/io\[([0-9]+)\]\s*←(.*?);?$/g, 'write( 32+$1, $2 )');
         str = str.replace(/io\[([0-9]+)@([0-9]+)\]\s*←(.*?);?$/g, 'this.writeBit( 32+$1, $2, $3 )');
         str = str.replace(/io\[([0-9+<]+)@([0-9]+)\]/g, 'this.readBit( 32+$1, $2, this.pc )');
-        str = str.replace(/io\[([0-9+<]+)\]/g, 'this.read( 32+$1, this.pc )');
+        str = str.replace(/io\[([0-9+<]+)\]/g, 'read( 32+$1, this.pc )');
         str = str.replace(/SP/g, 'sp');
         str = str.replace(/PC\s*←(.*)$/g, 't1 = $1;\n this.pc = t1; break;\n');
         str = str.replace(/PC/g, 'this.pc');
@@ -881,42 +1017,17 @@ class Atcore {
 
 }
 
-function parse( out ){
-    var opcode = 0;
-    var mask = 0;
-    var args = {};
-
-    var str = out.str, l=str.length;
-    for( var i=0; i<l; ++i ){
-        var chr = str[i];
-        var bit = (l-i-1)>>>0;
-        if( chr == '0' ){
-            mask |= 1<<bit;
-        }else if( chr == '1' ){
-            mask |= 1<<bit;
-            opcode |= 1<<bit;            
-        }else{
-            if( !(chr in args) )
-                args[chr] = 0;
-            args[chr] |= 1<<bit;
-        }
-    }
-
-    out.opcode = opcode;
-    out.mask = mask;
-    out.args = args;
-    out.bytes = (l/8)|0;
-}
-
 const AtCODEC = [
     {
         name: 'ADC',
+	score:141,
         str: '000111rdddddrrrr',
         impl: 'Rd ← Rd + Rr + SR@0;',
         flags:'hzvnsc'
     },
     {
         name: 'ADD',
+	score: 158,
         str: '000011rdddddrrrr',
         impl: 'Rd ← Rd + Rr;',
         flags:'hzvnsc'
@@ -1028,6 +1139,7 @@ const AtCODEC = [
     },
     {
         name: 'BRBS',
+	score:105,
         str:'111100kkkkkkksss',
         impl: [
             'if( SR@s ){',
@@ -1088,6 +1200,7 @@ const AtCODEC = [
     },
     {
         name: 'BRNE',
+	score:91,
         str:'111101kkkkkkk001',
         impl: [
             'if( !SR@1 ){',
@@ -1159,6 +1272,7 @@ const AtCODEC = [
     },
     {
         name: 'CALL',
+	score:143,
         str:'1001010kkkkk111kkkkkkkkkkkkkkkkk',
         cycles:4,
         impl: [
@@ -1170,7 +1284,7 @@ const AtCODEC = [
 	}
     },
     {
-	name: 'CBI',
+        name: 'CBI',
 	str: '10011000AAAAAbbb',
 	impl: 'I/O[a@b] ← 0;'
     },    
@@ -1185,7 +1299,7 @@ const AtCODEC = [
         flags: 'zns'
     },
     {
-	name: 'FMUL',
+        name: 'FMUL',
 	str:'000000110ddd1rrr',
 	impl:[
 	    't1 = Rd * Rr << 1',
@@ -1225,6 +1339,7 @@ const AtCODEC = [
     },
     {
         name: 'CPI',
+	score:83,
         str:'0011KKKKddddKKKK',
         impl: [
             'R = ((Rd - k) >>> 0) & 0xFF;',
@@ -1237,6 +1352,7 @@ const AtCODEC = [
     },
     {
         name: 'CPC',
+	score:107,
         str:'000001rdddddrrrr',
         impl: [
             'R = (Rd - Rr - SR@0) & 0xFF',
@@ -1334,12 +1450,14 @@ const AtCODEC = [
     },
     {
         name: 'LDI',
+	score:704,
         str:'1110KKKKddddKKKK',
         impl:'Rd ← k',
 	add:{d:16}
     },
     {
         name: 'LDS',
+	score: 243,
         str:'1001000xxxxx0000kkkkkkkkkkkkkkkk',
         impl:'Rx ← this.read(k)',
         bytes: 4
@@ -1395,6 +1513,7 @@ const AtCODEC = [
     },
     {
         name: 'LDYQ',
+	score:81,
         str:'10q0qq0ddddd1qqq',
         impl: [
             `Rd ← (Y+q);`
@@ -1467,6 +1586,7 @@ const AtCODEC = [
     },
     {
         name: 'MOV',
+	score:173,
         str: '001011rdddddrrrr',
         impl: [
             'Rd ← Rr;'
@@ -1474,6 +1594,7 @@ const AtCODEC = [
     },
     {
         name: 'MOVW',
+	score:250,
         str:'00000001ddddrrrr',
         impl:[
             'Rd = Rr',
@@ -1489,7 +1610,7 @@ const AtCODEC = [
 	}
     },
     {
-	name: 'MULSU',
+        name: 'MULSU',
 	str:'000000110ddd0rrr',
 	impl:[
 	    'i8a[0] = Rd',
@@ -1502,7 +1623,7 @@ const AtCODEC = [
 	add:{d:16, r:16}
     },
     {
-	name: 'MULS',
+        name: 'MULS',
 	str:'00000010ddddrrrr',
 	impl:[
 	    'i8a[0] = Rd',
@@ -1566,12 +1687,14 @@ const AtCODEC = [
     },
     {
         name: 'PUSH',
+	score: 123,
         str:'1001001ddddd1111',
         impl:'(STACK) ← Rd',
         cycles: 2
     },
     {
         name: 'POP',
+	score:160,
         str:'1001000ddddd1111',
         impl:'Rd ← (STACK)',
         cycles: 2
@@ -1622,6 +1745,7 @@ const AtCODEC = [
     },
     {
         name: 'RJMP',
+	score: 184,
         str:'1100kkkkkkkkkkkk',
         impl: `PC ← PC + (k << 20 >> 20) + 1`,
         end:true,
@@ -1645,7 +1769,7 @@ const AtCODEC = [
         impl: `SR@7 ← 1`
     },
     {
-	name: 'SFMUL',
+        name: 'SFMUL',
 	str:'000000111ddd0rrr',
 	impl:[
 	    'i8a[0] = Rd',
@@ -1660,6 +1784,7 @@ const AtCODEC = [
     },
     {
         name: 'STS',
+	score: 344,
         str:'1001001ddddd0000kkkkkkkkkkkkkkkk',
         impl: `this.write( k, Rd )`,
         bytes: 4
@@ -1709,6 +1834,7 @@ const AtCODEC = [
     },
     {
         name: 'STYQ',
+	score:121,
         str:'10q0qq1rrrrr1qqq',
         impl: [
             `(Y+q) ← Rr`
@@ -1770,6 +1896,7 @@ const AtCODEC = [
     },
     {
         name: 'SBCI',
+	score:70,
         str: '0100KKKKddddKKKK',
         impl: [
             'Rd ← (Rd - k - SR@0)&0xFF;',
@@ -1794,7 +1921,7 @@ const AtCODEC = [
         flags:'zns'
     },
     {
-	name: 'SBI',
+        name: 'SBI',
 	str: '10011010AAAAAbbb',
 	impl: 'I/O[a@b] ← 1;'
     },
@@ -1838,7 +1965,7 @@ const AtCODEC = [
         skip: true
     },
     {
-	name: 'SLEEP',
+        name: 'SLEEP',
 	str: '1001010110001000',
 	impl: [
 	    'this.sleeping = true',
@@ -1848,7 +1975,7 @@ const AtCODEC = [
 	cycles: 0
     },
     {
-	name: 'SWAP',
+        name: 'SWAP',
 	str: '1001010ddddd0010',
 	impl:[
 	    'Rd ← (Rd >>> 4) | (Rd << 4)'

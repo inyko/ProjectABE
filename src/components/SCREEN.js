@@ -63,19 +63,30 @@ class SCREEN {
 			this.lastFrameTime = performance.now();
 
 			if( !this.blinker )
-				this.blinker = this.DOM.create("span", {className:"RecordingIndicator"}, document.body);
+			    this.blinker = this.DOM.create(
+				"span", {
+				    className:"RecordingIndicator"
+				},
+				document.body
+			    );
 			
 			gif.on('finished', (blob, data) => {
 
 				
-				if( !this.saver )
-					this.saver = this.DOM.create("a", {className:"FileSaver", textContent:"GIF (save As...)"}, document.body);
-				else
-					URL.revokeObjectURL( this.saver.href );
+			    if( !this.saver ){
 				
-				this.saver.href = URL.createObjectURL( new Blob([data.buffer], { type:'image/gif' } ) );
-				this.saver.style.display = "block";
-				this.gif = null;
+				this.saver = this.DOM.create("a", {
+				    className:"FileSaver",
+				    textContent:"GIF",
+				    attr:{download:"ArduboyRecording"}
+				}, document.body);
+				
+			    }else
+				URL.revokeObjectURL( this.saver.href );
+				
+			    this.saver.href = URL.createObjectURL( new Blob([data.buffer], { type:'image/gif' } ) );
+			    this.saver.style.display = "block";
+			    this.gif = null;
 				
 			});
 
@@ -189,14 +200,16 @@ class SCREEN {
 	
 	let x = cs + this.col;
 	let y = (ps + this.page) * 8;
+	let fbdata = this.fb.data;
+	let iOffset = (y*128 + x) * 4;
 	
-	for( let i=0; i<8; ++i ){
-	    let offset = ((y+i)*128 + x) * 4;
+	for( let i=0; i<8; ++i, iOffset += 128*4 ){
+	    let offset = iOffset; // ((y+i)*128 + x) * 4;
 	    let bit = ((data >>> i) & 1) * 0xE0;
-	    this.fb.data[ offset++ ] = bit;
-	    this.fb.data[ offset++ ] = bit;
-	    this.fb.data[ offset++ ] = bit;
-	    this.fb.data[ offset++ ] = bit;
+	    fbdata[ offset++ ] = bit;
+	    fbdata[ offset++ ] = bit;
+	    fbdata[ offset++ ] = bit;
+	    fbdata[ offset++ ] = bit;
 	}
 
 	this.col++;

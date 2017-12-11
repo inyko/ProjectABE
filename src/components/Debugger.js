@@ -2,7 +2,6 @@ import { IController, Model, IView } from '../lib/mvc.js';
 import JSZip from 'jszip/dist/jszip.min.js';
 import DOM from '../lib/dry-dom.js';
 
-
 const compiler = "https://projectabe.herokuapp.com/";
 
 class Debugger {
@@ -13,7 +12,7 @@ class Debugger {
     }
 
     constructor( DOM ){
-
+	this.model.setItem("ram.fuzzy", []);
 	this.pool.add(this);
 	
 	this.DOM = DOM;
@@ -30,6 +29,8 @@ class Debugger {
 
 	this.code = null;
 	this.compileId = 0;
+
+	// this.initSource();
 	
     }
 
@@ -38,31 +39,114 @@ class Debugger {
     }    
 
     initSource(){
+	if( this.source )
+	    return true;
 	
-	if( !this.model.getItem("app.source") ){
-	    this.model.setItem("app.source", {
-		"main.ino":`
+	this.source = this.model.getModel(
+	    this.model.getItem("app.srcpath"),
+	    true
+	) || new Model();
 
+	let promise = null;
+
+	let srcurl = this.model.getItem("ram.srcurl", "");
+
+	if( /.*\.ino$/.test(srcurl) ){
+	    
+	    promise = fetch( this.model.getItem("app.proxy") + srcurl )
+		.then( rsp => rsp.text() )
+		.then( txt => {
+
+		    if( txt.charCodeAt(0) == 0xFEFF )
+			txt = txt.substr(1);
+		    
+		    this.addNewFile( "main.ino", txt );
+		    
+		});
+	    
+	}else if( srcurl ){
+
+	    promise = fetch( this.model.getItem("app.proxy") + srcurl )
+		.then( rsp => rsp.arrayBuffer() )
+		.then( buff => JSZip.loadAsync( buff ) )
+		.then( z => this.importZipSourceFiles(z) );
+
+	}else if( !Object.keys(this.source.data).length ){
+	    this.addNewFile(
+		"main.ino",
+`/*
+Hello, World! example
+June 11, 2015
+Copyright (C) 2015 David Martinez
+All rights reserved.
+This code is the most basic barebones code for writing a program for Arduboy.
+
+This library is free software; you can redistribute it and/or
+modify it under the terms of the GNU Lesser General Public
+License as published by the Free Software Foundation; either
+version 2.1 of the License, or (at your option) any later version.
+*/
+
+#include <Arduboy2.h>
+
+// make an instance of arduboy used for many functions
+Arduboy2 arduboy;
+
+
+// This function runs once in your game.
+// use it for anything that needs to be set only once in your game.
 void setup() {
-  // initialize digital pin RED_LED as an output.
-  pinMode(10, OUTPUT);
+  // initiate arduboy instance
+  arduboy.begin();
+
+  // here we set the framerate to 15, we do not need to run at
+  // default 60 and it saves us battery life
+  arduboy.setFrameRate(15);
 }
 
-// the loop function runs over and over again forever
+
+// our main game loop, this runs once every cycle/frame.
+// this is where our game logic goes.
 void loop() {
-  digitalWrite(10, HIGH);   // turn the LED off
-  delay(1000);                       // wait for a second
-  digitalWrite(10, LOW);    // turn the LED on
-  delay(1000);                       // wait for a second
+  // pause render until it's time for the next frame
+  if (!(arduboy.nextFrame()))
+    return;
+
+  // first we clear our screen to black
+  arduboy.clear();
+
+  // we set our cursor 5 pixels to the right and 10 down from the top
+  // (positions start at 0, 0)
+  arduboy.setCursor(4, 9);
+
+  // then we print to screen what is in the Quotation marks ""
+  arduboy.print(F("Hello, world!"));
+
+  // then we finaly we tell the arduboy to display what we just wrote to the display
+  arduboy.display();
 }
-
-
 `
-	    });
+	    );
 	}
 
+	
+	if( promise )
+	    promise.catch(err => {
+		console.error( err.toString() );
+		core.history.push( err.toString() );
+		this.DOM.element.setAttribute("data-tab", "history");
+		this.refreshHistory();
+	    });
+	
+	if( !this.source )
+	    return false;
+
+	this.initEditor();
+
+	return true;
+	
 	let main = null;
-	for( let k in this.model.getItem("app.source") ){
+	for( let k in this.source ){
 	    if( /.*\.ino$/.test(k) ){
 		main = k;
 		break;
@@ -72,9 +156,6 @@ void loop() {
 	if( main !== null )
 	    this.DOM.currentFile.value = main;
 
-	this.initEditor();
-
-	this.changeSourceFile();
 	
     }
 
@@ -125,6 +206,8 @@ void loop() {
 	    }
 	    
 	});
+
+//	this.code.setKeyboardHandler("ace/keyboard/emacs");
 		
         this.code.commands.addCommand({
             name: "replace",
@@ -132,47 +215,78 @@ void loop() {
             exec: () => this.compile()
         });	    
 
+        this.code.commands.addCommand({
+            name: "fuzzy",
+            bindKey: {win: "Ctrl-P", mac: "Command-P"},
+            exec: () => this.showFuzzyFinder()
+        });	    
+
+	this.changeSourceFile();
+
     }
 
     deleteFile(){
+	if( !this.initSource() ) return;
+
 	if( !confirm("Are you sure you want to delete " + this.DOM.currentFile.value + "?") )
 	    return;
-	this.model.removeItem( ["app", "source", this.DOM.currentFile.value] );
-	this.DOM.currentFile.value = Object.keys(this.model.getItem(["app", "source"]))[0];
+	this.source.removeItem([this.DOM.currentFile.value]);
+	this.DOM.currentFile.value = Object.keys(this.source.data)[0];
 	this.changeSourceFile();
     }
 
     renameFile(){
+	if( !this.initSource() ) return;
+
 	let current = this.DOM.currentFile.value;
 	let target = prompt("Rename " + current + " to:").trim();
 	if( target == "" ) return;
-	let src = this.model.getItem(["app", "source", current]);
-	this.model.removeItem(["app", "source", current]);
-	this.model.setItem(["app", "source", target], src);
+	let src = this.source.getItem([current]);
+	this.source.removeItem([current]);
+	this.source.setItem([target], src);
 	this.DOM.currentFile.value = target;
     }
 
-    addNewFile(){
-	let target = prompt("File name:").trim();
+    addNewFile( target, content ){
+	if( !this.initSource() ) return;
+
+	if( typeof target !== "string" )
+	    target = prompt("File name:").trim();
+	
 	if( target == "" ) return;
-	this.model.setItem( ["app", "source", target], "" );
+
+	if( typeof content !== "string" )
+	    content = "";
+	
+	this.source.setItem( [target], content );
 	this.DOM.currentFile.value = target;
+	
 	this.changeSourceFile();
+	
     }
 
     zip(){
 	
 	var zip = new JSZip();
-	let source = this.model.getItem("app.source");
+	let source = this.source.data;
 	
 	for( let name in source )
 	    zip.file( name, source[name]);
 	
 	zip.generateAsync({type:"blob"})
 	    .then( content => {
-		if( !this.saver )
-		    this.saver = this.DOM.create("a", {className:"FileSaver", textContent:"ZIP (save As...)"}, document.body);
-		else
+		
+		if( !this.saver ){
+		    
+		    this.saver = this.DOM.create("a", {
+			className:"FileSaver",
+			textContent:"ZIP",
+			attr:{
+			    download:"ArduboyProject"
+			}
+		    }, document.body);
+		    
+		}else
 		    URL.revokeObjectURL( this.saver.href );
 				
 		this.saver.href = URL.createObjectURL( content );
@@ -196,21 +310,13 @@ void loop() {
 		    
 		    if( txt.charCodeAt(0) == 0xFEFF )
 			txt = txt.substr(1);
-		    
-		    this.model.setItem([
-			"app",
-			"source",
-			name.replace(/\\/g, "/")
-		    ],txt );
+
+		    this.addNewFile( name.replace(/\\/g, "/"), txt );
 		    
 		})
 		.catch( err => {
 		    console.error( err.toString() );
-		    this.model.setItem([
-			"app",
-			"source",
-			name
-		    ], "// ERROR LOADING: " + err)
+		    this.source.setItem([name], "// ERROR LOADING: " + err)
 		});
 	}
 	
@@ -269,8 +375,7 @@ void loop() {
 
 			let masksrc = "\nconst unsigned char PROGMEM " + cleanName + "_mask[] = ";
 
-			let src = "#ifndef BMP_" + cleanName.toUpperCase() + "_H\n";
-			src += "#define BMP_" + cleanName.toUpperCase() + "_H\n";
+			let src = "";
 			src += "\n\nconst unsigned char PROGMEM " + cleanName + "[] = ";
 			
 		        src += "{\n// width, height,\n" + width + ", " + img.naturalHeight;
@@ -319,9 +424,39 @@ void loop() {
 			if( isPNG )
 			    src += masksrc;
 			
-			src += "#endif\n";
+			src += "\n";
+
+			var bmpcpp = this.source.getItem(["bmp.cpp"], "#include <Arduino.h>\n#include \"bmp.h\"\n");
+			var hasHeader = false;
+			var headerPath = "bmp/" + cleanName + ".h";
 			
-			this.model.setItem(["app", "source", "bmp/" + cleanName + ".h"], src);
+			bmpcpp.replace(/(?:^|\n)\s*#include\s+"([^"]+)"/g, (_, inc) =>{
+			    hasHeader = hasHeader || inc == headerPath;
+			    return "";
+			});
+			
+			if( !hasHeader )
+			    bmpcpp += "\n#include \"" + headerPath + "\"\n";
+
+			this.source.setItem(["bmp.cpp"], bmpcpp);
+
+			var bmph = this.source.getItem(["bmp.h"], "");
+			var hasExtern = false;
+
+			bmph.replace(/(?:^|\n)\s*extern\s+const\s+unsigned\s+char\s+PROGMEM\s+([^\[\s\[]+)/g, (_, inc) => {
+			    hasExtern = hasExtern || inc == cleanName;
+			});
+
+			if( !hasExtern ){
+			    bmph = "extern const unsigned char PROGMEM " +
+				cleanName + "[], " +
+				cleanName + "_mask[];\n" +
+				bmph;
+			}
+
+			this.source.setItem(["bmp.h"], bmph);
+			
+			this.addNewFile( headerPath, src );
 			
 		    }
 		    
@@ -337,6 +472,8 @@ void loop() {
     changeBreakpoints(){
 
 	this.code.session.clearBreakpoints();
+	if( typeof core == "undefined" ) return;
+
 	let paused = null;
 	for( let addr in core.breakpoints ){
 	    
@@ -349,7 +486,7 @@ void loop() {
 		}
 		this.code.session.setBreakpoint( this.srcmap[addr].line-1, c );
 	    }
-	    
+	    	    
 	}
 	
 	if( !paused && this.srcmap[ this.currentPC ] ){
@@ -358,13 +495,99 @@ void loop() {
 	
     }
 
+    showFuzzyFinder(){
+	this.DOM.currentFile.style.display = "none";
+	this.DOM.fuzzyContainer.style.display = "block";
+	this.DOM.fuzzy.focus();
+	this.DOM.fuzzy.setSelectionRange(0, this.DOM.fuzzy.value.length);
+    }
+
+    updateFuzzyFind( dom, evt ){
+
+	let matches;
+	let str = this.DOM.fuzzy.value.trim().replace();
+	
+	if( str.length > 1 ) matches = fuzzy( str, Object.keys(this.source.data) );
+	else matches = [];
+	
+	this.model.setItem( "ram.fuzzy", matches.sort( (a,b)=>a.rank-b.rank ).map( a=>a.match ) );
+
+
+	function fuzzy( str, args ){
+
+	    if ( str === void 0 ) str = '';
+	    if ( args === void 0 ) args = [];
+
+	    var escaped = str.replace(/[|\\{}()\[\]^$+*?.]/g, '\\$&');
+	    var regex = new RegExp(((escaped.split(/(\\.|)/).filter( x=>x.length ).join('(.*)')) + ".*"));
+	    var length = str.length;
+
+	    return args.reduce(function (acc, possibleMatch) {
+		var result = regex.exec(possibleMatch);
+
+		if (result) {
+		    acc.push({
+			match: possibleMatch,
+			rank: result.index
+		    });
+		}
+		return acc
+	    }, []);
+	    
+	}
+    }
+
+    cancelFuzzyFind( dom, evt ){
+	
+	if( evt ) return setTimeout( _=>this.cancelFuzzyFind(), 10 );
+	
+	this.DOM.fuzzyContainer.style.display = "none";
+	this.DOM.currentFile.style.display = "";
+	this.code.focus();
+	
+    }
+
+    endFuzzyFind( dom, evt ){
+	
+	let results = this.model.getItem("ram.fuzzy", []);
+	let result = null;
+	
+	if( evt ){
+	    if( evt.type == "keydown" ){
+		
+		if( evt.key == "Escape")
+		    return this.cancelFuzzyFind();
+		else if( evt.key != "Enter" )
+		    return;
+
+		evt.preventDefault();
+		evt.stopPropagation();
+		
+	    }else if( evt.target.textContent in this.source.data )		
+		result = evt.target.textContent;
+	    
+	}
+    
+	if( !result && results.length )
+	    result = results[0];
+	
+	if( result ){
+	    this.DOM.currentFile.value = result;
+	    setTimeout( _=>this.changeSourceFile(), 10 );
+	}
+	
+	this.cancelFuzzyFind();
+	
+    }
+
     changeSourceFile(){
-	this.code.setValue( this.model.getItem("app.source", {})[ this.DOM.currentFile.value ] || "" );
+	if( !this.code ) return;
+	this.code.setValue( this.source.getItem([ this.DOM.currentFile.value ],"") );
 	this.changeBreakpoints();
     }
 
     initHints( txt ){
-	let source = this.model.getItem("app.source");
+	let source = this.source.data;
 	this.srcmap = [];
 	this.rsrcmap = {};
 	txt.replace(
@@ -421,7 +644,54 @@ void loop() {
     }
 
     commit(){
-	this.model.setItem( ["app","source",this.DOM.currentFile.value], this.code.getValue() );
+	this.source.setItem( [this.DOM.currentFile.value], this.code.getValue() );
+    }
+
+    initQRCGen(){
+	if( typeof QRCode == "undefined" ){
+	    self.QRCode = false;
+	    DOM.create("script", {src:"qrcode.min.js"}, document.head);
+	}
+    }
+    
+    updateQRCode( url ){
+
+	this.initQRCGen();
+
+	if( !self.QRCode )
+	    return;
+	
+	url = url.replace(/^https?:/i, "arduboy:");
+	
+	if( !this.qrcode ){
+	    
+	    this.qrcode = new QRCode( this.DOM.qrcContainer, {
+		text:url,
+		correctLevel: QRCode.CorrectLevel.L
+	    });
+	    
+	}else{
+	    
+	    this.qrcode.clear();
+	    this.qrcode.makeCode( url );
+	    
+	}
+	    
+	this.DOM.qrc.style.display = "inline";
+
+	if( this.qrcClearTH )
+	    clearTimeout( this.qrcClearTH );
+
+	this.qrcClearTH = setTimeout( _=>{
+	    
+	    this.qrcode.clear();
+	    this.DOM.qrc.style.display = "none";
+	    if( this.DOM.element.getAttribute("data-tab") == "qr" )
+ 		this.DOM.element.setAttribute("data-tab", "source");
+
+	    
+	}, 50000 );
+	
     }
 
     compile(){
@@ -432,8 +702,11 @@ void loop() {
 
 	this.commit();
 
-	let src = Object.assign({}, this.model.getItem("app.source"));
-	delete src["disassembly.s"];
+	let src = {};
+	for( let key in this.source.data ){
+	    if( /.*\.(?:hpp|h|c|cpp|ino)$/i.test(key) )
+		src[key] = this.source.data[key];
+	}
 
 	let mainFile = null;
 	Object.keys(src).forEach( k => {
@@ -450,6 +723,8 @@ void loop() {
 		
 	    }
 	});
+
+	this.initQRCGen();
 
 	fetch( compiler + "build", {
 	    method:"POST",
@@ -488,13 +763,22 @@ void loop() {
 		    
 		    let data = JSON.parse( txt );
 		    this.model.removeItem("app.AT32u4");
-		    this.model.setItem("app.AT32u4.url", compiler + data.path );
+
+		    this.updateQRCode( compiler + data.path );
+		    
+		    fetch( compiler + data.path )
+			.then( rsp => rsp.text() )
+			.then( text => {
+			    
+			    this.model.setItem("app.AT32u4.hex", text);
+			    this.source.setItem(["build.hex"], text);
+			    this.pool.call("loadFlash");
+			});
+
 		    this.initHints( data.disassembly );
-		    core.history.push( data.stdout );
-		    this.pool.call("loadFlash");
 		    this.DOM.compile.style.display = "initial";
 		    
-		    this.model.setItem(["app","source", "disassembly.s"], data.disassembly);
+		    this.source.setItem(["disassembly.s"], data.disassembly);
 		    
 		}else if( /^ERROR[\s\S]*/.test(txt) ){
 
@@ -690,7 +974,7 @@ void loop() {
 	
 	this.DOM.daAddress.value = (Math.max(pc-5,0)<<1).toString(16);
 	this.refreshDa();
-	if( srcref && !srcref.offset && this.model.getItem(["app", "source", srcref.file]) ){
+	if( srcref && !srcref.offset && this.source.getItem([srcref.file]) ){
 	    this.DOM.element.setAttribute("data-tab", "source");
 	    this.DOM.currentFile.value = srcref.file;
 	    this.changeSourceFile();
